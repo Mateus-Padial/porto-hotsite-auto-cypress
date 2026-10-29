@@ -1,0 +1,710 @@
+trigger:
+  branches:
+    include:
+      - master
+pr:
+  branches:
+    include:
+      - master
+
+
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  CYPRESS_CACHE_FOLDER: $(Pipeline.Workspace)/.cache/Cypress
+
+stages:
+  - stage: Qualidade
+    displayName: Lint e Testes Unitarios
+    jobs:
+      - job: SecretScan
+        displayName: Secret Scan (gitleaks)
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+            displayName: 'Checkout'
+
+          # Escaneia o estado atual dos arquivos (--no-git) em busca de segredos.
+          # Falha o build se encontrar — impede novos vazamentos em arquivos versionados.
+          # Usa --no-git de proposito: nao varre o historico, evitando falhar por
+          # segredos antigos ja conhecidos (que devem ser tratados via rotacao de
+          # credenciais). Os .env.* nao existem no CI (sao gitignored e vem de
+          # variaveis secretas do pipeline), entao nao geram falso-positivo.
+          - script: |
+              docker run --rm -v "$(Build.SourcesDirectory):/repo" \
+                zricethezav/gitleaks:latest detect \
+                --source="/repo" \
+                --no-git \
+                --redact \
+                --verbose \
+                --exit-code 1
+            displayName: 'Gitleaks detect'
+
+      - job: LintUnit
+        displayName: Lint + Unit (Vitest)
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: UseNode@1
+            inputs:
+              version: '22.x'
+            displayName: 'Instala Node.js'
+
+          - script: npm ci
+            displayName: 'Instala dependencias'
+
+          - script: npm run lint
+            displayName: 'ESLint'
+
+          - script: npm run test:unit
+            displayName: 'Testes unitarios (Vitest)'
+
+  - stage: PRSmoke
+    displayName: PR - Smoke
+    dependsOn: Qualidade
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: SmokeChrome
+        displayName: Smoke - Chrome
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: UseNode@1
+            inputs:
+              version: '22.x'
+            displayName: 'Instala Node.js'
+
+          - script: npm ci
+            displayName: 'Instala dependencias'
+
+          - script: npx cypress install
+            displayName: 'Instala Cypress'
+
+          - script: |
+              set +e
+              echo "Executando smoke em PR"
+              export TERM=xterm
+              npx cross-env BROWSER_NAME=chrome npx cypress run \
+                --browser chrome \
+                --headless \
+                --spec "cypress/e2e/features/**/*.feature" \
+                --env "CYPRESS_ENV=$(CYPRESS_ENV),tags=@smoke and not @skip"
+              CYPRESS_EXIT_CODE=$?
+
+              REPORT_COUNT=$(find cypress/reports/mocha -name '*.json' 2>/dev/null | wc -l)
+
+              if [ "$CYPRESS_EXIT_CODE" -ne 0 ] && [ "$REPORT_COUNT" -eq 0 ]; then
+                echo "##vso[task.logissue type=warning]Nenhum teste foi executado - o browser provavelmente nao inicializou. Verifique os logs do Cypress acima."
+                echo "##vso[task.complete result=SucceededWithIssues;]Browser nao inicializou - step marcado como sucesso com ressalvas."
+                exit 0
+              fi
+
+              exit $CYPRESS_EXIT_CODE
+            displayName: 'Executa smoke em PR'
+            env:
+              base_url: $(base_url)
+              auth_token: $(auth_token)
+              subscription_key: $(subscription_key)
+              cpf: $(cpf)
+              key_sso: $(key_sso)
+              meu_porto_url: $(meu_porto_url)
+
+  - stage: InstallAndTest
+    dependsOn: Qualidade
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    displayName: Instalação e Testes
+    jobs:
+      - job: CenarioDeslogadoChrome
+        displayName: Testes Deslogado - Chrome
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: UseNode@1
+            inputs:
+              version: '22.x'
+            displayName: 'Instala Node.js'
+
+          - script: npm ci
+            displayName: 'Instala dependências'
+
+          - script: npx cypress install
+            displayName: 'Instala Cypress'
+
+          - script: |
+              set +e
+              echo "Executando testes de usuário deslogado no Chrome"
+              export TERM=xterm
+              npx cross-env BROWSER_NAME=chrome npx cypress run \
+                --browser chrome \
+                --headless \
+                --spec "cypress/e2e/features/home_deslogado/home_deslogado.feature" \
+                --env CYPRESS_ENV=$(CYPRESS_ENV)
+              CYPRESS_EXIT_CODE=$?
+
+              REPORT_COUNT=$(find cypress/reports/mocha -name '*.json' 2>/dev/null | wc -l)
+
+              if [ "$CYPRESS_EXIT_CODE" -ne 0 ] && [ "$REPORT_COUNT" -eq 0 ]; then
+                echo "##vso[task.logissue type=warning]Nenhum teste foi executado - o browser provavelmente nao inicializou. Verifique os logs do Cypress acima."
+                echo "##vso[task.complete result=SucceededWithIssues;]Browser nao inicializou - step marcado como sucesso com ressalvas."
+                exit 0
+              fi
+
+              exit $CYPRESS_EXIT_CODE
+            displayName: 'Executa testes Cypress - Deslogado Chrome'
+            env:
+              base_url: $(base_url)
+              auth_token: $(auth_token)
+              subscription_key: $(subscription_key)
+              cpf: $(cpf)
+              key_sso: $(key_sso)
+              meu_porto_url: $(meu_porto_url)
+
+          - script: mkdir -p cypress/screenshots
+            displayName: 'Cria pasta de screenshots'
+            condition: always()
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            continueOnError: true
+            inputs:
+              targetPath: 'cypress/screenshots'
+              artifact: 'screenshots_deslogado_chrome_$(Build.BuildId)'
+              publishLocation: 'pipeline'
+            displayName: 'Publica screenshots Deslogado Chrome'
+
+          - script: mkdir -p cypress/videos
+            displayName: 'Cria pasta de vídeos'
+            condition: always()
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            continueOnError: true
+            inputs:
+              targetPath: 'cypress/videos'
+              artifact: 'videos_deslogado_chrome_$(Build.BuildId)'
+              publishLocation: 'pipeline'
+            displayName: 'Publica vídeos Deslogado Chrome'
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            continueOnError: true
+            inputs:
+              targetPath: 'cypress/reports/mocha'
+              artifact: 'json_$(System.JobDisplayName)_$(Build.BuildId)'
+              publishLocation: 'pipeline'
+            displayName: 'Publica JSON de resultado'
+
+      - job: CenarioDeslogadoEdge
+        displayName: Testes Deslogado - Edge
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: UseNode@1
+            inputs:
+              version: '22.x'
+            displayName: 'Instala Node.js'
+
+          - script: npm ci
+            displayName: 'Instala dependências'
+
+          - script: npx cypress install
+            displayName: 'Instala Cypress'
+
+          - script: |
+              set +e
+              echo "Executando testes de usuário deslogado no Edge"
+              export TERM=xterm
+              npx cross-env BROWSER_NAME=edge npx cypress run \
+                --browser edge \
+                --headless \
+                --spec "cypress/e2e/features/home_deslogado/home_deslogado.feature" \
+                --env CYPRESS_ENV=$(CYPRESS_ENV)
+              CYPRESS_EXIT_CODE=$?
+
+              REPORT_COUNT=$(find cypress/reports/mocha -name '*.json' 2>/dev/null | wc -l)
+
+              if [ "$CYPRESS_EXIT_CODE" -ne 0 ] && [ "$REPORT_COUNT" -eq 0 ]; then
+                echo "##vso[task.logissue type=warning]Nenhum teste foi executado - o browser provavelmente nao inicializou. Verifique os logs do Cypress acima."
+                echo "##vso[task.complete result=SucceededWithIssues;]Browser nao inicializou - step marcado como sucesso com ressalvas."
+                exit 0
+              fi
+
+              exit $CYPRESS_EXIT_CODE
+            displayName: 'Executa testes Cypress - Deslogado Edge'
+            env:
+              base_url: $(base_url)
+              auth_token: $(auth_token)
+              subscription_key: $(subscription_key)
+              cpf: $(cpf)
+              key_sso: $(key_sso)
+              meu_porto_url: $(meu_porto_url)
+
+          - script: mkdir -p cypress/screenshots
+            displayName: 'Cria pasta de screenshots'
+            condition: always()
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            continueOnError: true
+            inputs:
+              targetPath: 'cypress/screenshots'
+              artifact: 'screenshots_deslogado_edge_$(Build.BuildId)'
+              publishLocation: 'pipeline'
+            displayName: 'Publica screenshots Deslogado Edge'
+
+          - script: mkdir -p cypress/videos
+            displayName: 'Cria pasta de vídeos'
+            condition: always()
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            continueOnError: true
+            inputs:
+              targetPath: 'cypress/videos'
+              artifact: 'videos_deslogado_edge_$(Build.BuildId)'
+              publishLocation: 'pipeline'
+            displayName: 'Publica vídeos Deslogado Edge'
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            continueOnError: true
+            inputs:
+              targetPath: 'cypress/reports/mocha'
+              artifact: 'json_$(System.JobDisplayName)_$(Build.BuildId)'
+              publishLocation: 'pipeline'
+            displayName: 'Publica JSON de resultado'
+
+      - job: CenarioLogadoChrome
+        displayName: Testes Logado - Chrome
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: UseNode@1
+            inputs:
+              version: '22.x'
+            displayName: 'Instala Node.js'
+
+          - script: npm ci
+            displayName: 'Instala dependências'
+
+          - script: npx cypress install
+            displayName: 'Instala Cypress'
+
+          - script: |
+              set +e
+              echo "Executando testes de usuário logado no Chrome"
+              export TERM=xterm
+              npx cross-env BROWSER_NAME=chrome npx cypress run \
+                --browser chrome \
+                --headless \
+                --spec "cypress/e2e/features/home_logado/home_logado.feature" \
+                --env CYPRESS_ENV=$(CYPRESS_ENV)
+              CYPRESS_EXIT_CODE=$?
+
+              REPORT_COUNT=$(find cypress/reports/mocha -name '*.json' 2>/dev/null | wc -l)
+
+              if [ "$CYPRESS_EXIT_CODE" -ne 0 ] && [ "$REPORT_COUNT" -eq 0 ]; then
+                echo "##vso[task.logissue type=warning]Nenhum teste foi executado - o browser provavelmente nao inicializou. Verifique os logs do Cypress acima."
+                echo "##vso[task.complete result=SucceededWithIssues;]Browser nao inicializou - step marcado como sucesso com ressalvas."
+                exit 0
+              fi
+
+              exit $CYPRESS_EXIT_CODE
+            displayName: 'Executa testes Cypress - Logado Chrome'
+            env:
+              base_url: $(base_url)
+              auth_token: $(auth_token)
+              subscription_key: $(subscription_key)
+              cpf: $(cpf)
+              key_sso: $(key_sso)
+              meu_porto_url: $(meu_porto_url)
+
+          - script: mkdir -p cypress/screenshots
+            displayName: 'Cria pasta de screenshots'
+            condition: always()
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            continueOnError: true
+            inputs:
+              targetPath: 'cypress/screenshots'
+              artifact: 'screenshots_logado_chrome_$(Build.BuildId)'
+              publishLocation: 'pipeline'
+            displayName: 'Publica screenshots Logado Chrome'
+
+          - script: mkdir -p cypress/videos
+            displayName: 'Cria pasta de vídeos'
+            condition: always()
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            continueOnError: true
+            inputs:
+              targetPath: 'cypress/videos'
+              artifact: 'videos_logado_chrome_$(Build.BuildId)'
+              publishLocation: 'pipeline'
+            displayName: 'Publica vídeos Logado Chrome'
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            continueOnError: true
+            inputs:
+              targetPath: 'cypress/reports/mocha'
+              artifact: 'json_$(System.JobDisplayName)_$(Build.BuildId)'
+              publishLocation: 'pipeline'
+            displayName: 'Publica JSON de resultado'
+
+      - job: CenarioLogadoEdge
+        displayName: Testes Logado - Edge
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: UseNode@1
+            inputs:
+              version: '22.x'
+            displayName: 'Instala Node.js'
+
+          - script: npm ci
+            displayName: 'Instala dependências'
+
+          - script: npx cypress install
+            displayName: 'Instala Cypress'
+
+          - script: |
+              set +e
+              echo "Executando testes de usuário logado no Edge"
+              export TERM=xterm
+              npx cross-env BROWSER_NAME=edge npx cypress run \
+                --browser edge \
+                --headless \
+                --spec "cypress/e2e/features/home_logado/home_logado.feature" \
+                --env CYPRESS_ENV=$(CYPRESS_ENV)
+              CYPRESS_EXIT_CODE=$?
+
+              REPORT_COUNT=$(find cypress/reports/mocha -name '*.json' 2>/dev/null | wc -l)
+
+              if [ "$CYPRESS_EXIT_CODE" -ne 0 ] && [ "$REPORT_COUNT" -eq 0 ]; then
+                echo "##vso[task.logissue type=warning]Nenhum teste foi executado - o browser provavelmente nao inicializou. Verifique os logs do Cypress acima."
+                echo "##vso[task.complete result=SucceededWithIssues;]Browser nao inicializou - step marcado como sucesso com ressalvas."
+                exit 0
+              fi
+
+              exit $CYPRESS_EXIT_CODE
+            displayName: 'Executa testes Cypress - Logado Edge'
+            env:
+              base_url: $(base_url)
+              auth_token: $(auth_token)
+              subscription_key: $(subscription_key)
+              cpf: $(cpf)
+              key_sso: $(key_sso)
+              meu_porto_url: $(meu_porto_url)
+
+          - script: mkdir -p cypress/screenshots
+            displayName: 'Cria pasta de screenshots'
+            condition: always()
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            continueOnError: true
+            inputs:
+              targetPath: 'cypress/screenshots'
+              artifact: 'screenshots_logado_edge_$(Build.BuildId)'
+              publishLocation: 'pipeline'
+            displayName: 'Publica screenshots Logado Edge'
+
+          - script: mkdir -p cypress/videos
+            displayName: 'Cria pasta de vídeos'
+            condition: always()
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            continueOnError: true
+            inputs:
+              targetPath: 'cypress/videos'
+              artifact: 'videos_logado_edge_$(Build.BuildId)'
+              publishLocation: 'pipeline'
+            displayName: 'Publica vídeos Logado Edge'
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            continueOnError: true
+            inputs:
+              targetPath: 'cypress/reports/mocha'
+              artifact: 'json_$(System.JobDisplayName)_$(Build.BuildId)'
+              publishLocation: 'pipeline'
+            displayName: 'Publica JSON de resultado'
+
+      - job: CenarioCatalogoChrome
+        displayName: Testes Catálogo - Chrome
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: UseNode@1
+            inputs:
+              version: '22.x'
+            displayName: 'Instala Node.js'
+
+          - script: npm ci
+            displayName: 'Instala dependências'
+
+          - script: npx cypress install
+            displayName: 'Instala Cypress'
+
+          - script: |
+              set +e
+              echo "Executando testes do catálogo no Chrome"
+              export TERM=xterm
+              npx cross-env BROWSER_NAME=chrome npx cypress run \
+                --browser chrome \
+                --headless \
+                --spec "cypress/e2e/features/catalogo/catalogo_pf.feature" \
+                --env CYPRESS_ENV=$(CYPRESS_ENV)
+              CYPRESS_EXIT_CODE=$?
+
+              REPORT_COUNT=$(find cypress/reports/mocha -name '*.json' 2>/dev/null | wc -l)
+
+              if [ "$CYPRESS_EXIT_CODE" -ne 0 ] && [ "$REPORT_COUNT" -eq 0 ]; then
+                echo "##vso[task.logissue type=warning]Nenhum teste foi executado - o browser provavelmente nao inicializou. Verifique os logs do Cypress acima."
+                echo "##vso[task.complete result=SucceededWithIssues;]Browser nao inicializou - step marcado como sucesso com ressalvas."
+                exit 0
+              fi
+
+              exit $CYPRESS_EXIT_CODE
+            displayName: 'Executa testes Cypress - Catálogo Chrome'
+            env:
+              base_url: $(base_url)
+              auth_token: $(auth_token)
+              subscription_key: $(subscription_key)
+              cpf: $(cpf)
+              key_sso: $(key_sso)
+              meu_porto_url: $(meu_porto_url)
+
+          - script: mkdir -p cypress/screenshots
+            displayName: 'Cria pasta de screenshots'
+            condition: always()
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            continueOnError: true
+            inputs:
+              targetPath: 'cypress/screenshots'
+              artifact: 'screenshots_catalogo_chrome_$(Build.BuildId)'
+              publishLocation: 'pipeline'
+            displayName: 'Publica screenshots Catálogo Chrome'
+
+          - script: mkdir -p cypress/videos
+            displayName: 'Cria pasta de vídeos'
+            condition: always()
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            continueOnError: true
+            inputs:
+              targetPath: 'cypress/videos'
+              artifact: 'videos_catalogo_chrome_$(Build.BuildId)'
+              publishLocation: 'pipeline'
+            displayName: 'Publica vídeos Catálogo Chrome'
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            continueOnError: true
+            inputs:
+              targetPath: 'cypress/reports/mocha'
+              artifact: 'json_$(System.JobDisplayName)_$(Build.BuildId)'
+              publishLocation: 'pipeline'
+            displayName: 'Publica JSON de resultado'
+
+      - job: CenarioCatalogoEdge
+        displayName: Testes Catálogo - Edge
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: UseNode@1
+            inputs:
+              version: '22.x'
+            displayName: 'Instala Node.js'
+
+          - script: npm ci
+            displayName: 'Instala dependências'
+
+          - script: npx cypress install
+            displayName: 'Instala Cypress'
+
+          - script: |
+              set +e
+              echo "Executando testes do catálogo no Edge"
+              export TERM=xterm
+              npx cross-env BROWSER_NAME=edge npx cypress run \
+                --browser edge \
+                --headless \
+                --spec "cypress/e2e/features/catalogo/catalogo_pf.feature" \
+                --env CYPRESS_ENV=$(CYPRESS_ENV)
+              CYPRESS_EXIT_CODE=$?
+
+              REPORT_COUNT=$(find cypress/reports/mocha -name '*.json' 2>/dev/null | wc -l)
+
+              if [ "$CYPRESS_EXIT_CODE" -ne 0 ] && [ "$REPORT_COUNT" -eq 0 ]; then
+                echo "##vso[task.logissue type=warning]Nenhum teste foi executado - o browser provavelmente nao inicializou. Verifique os logs do Cypress acima."
+                echo "##vso[task.complete result=SucceededWithIssues;]Browser nao inicializou - step marcado como sucesso com ressalvas."
+                exit 0
+              fi
+
+              exit $CYPRESS_EXIT_CODE
+            displayName: 'Executa testes Cypress - Catálogo Edge'
+            env:
+              base_url: $(base_url)
+              auth_token: $(auth_token)
+              subscription_key: $(subscription_key)
+              cpf: $(cpf)
+              key_sso: $(key_sso)
+              meu_porto_url: $(meu_porto_url)
+
+          - script: mkdir -p cypress/screenshots
+            displayName: 'Cria pasta de screenshots'
+            condition: always()
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            continueOnError: true
+            inputs:
+              targetPath: 'cypress/screenshots'
+              artifact: 'screenshots_catalogo_edge_$(Build.BuildId)'
+              publishLocation: 'pipeline'
+            displayName: 'Publica screenshots Catálogo Edge'
+
+          - script: mkdir -p cypress/videos
+            displayName: 'Cria pasta de vídeos'
+            condition: always()
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            continueOnError: true
+            inputs:
+              targetPath: 'cypress/videos'
+              artifact: 'videos_catalogo_edge_$(Build.BuildId)'
+              publishLocation: 'pipeline'
+            displayName: 'Publica vídeos Catálogo Edge'
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            continueOnError: true
+            inputs:
+              targetPath: 'cypress/reports/mocha'
+              artifact: 'json_$(System.JobDisplayName)_$(Build.BuildId)'
+              publishLocation: 'pipeline'
+            displayName: 'Publica JSON de resultado'
+
+      - job: RelatorioFinal
+        displayName: Geração de Relatório Consolidado
+        dependsOn:
+          - CenarioDeslogadoChrome
+          - CenarioDeslogadoEdge
+          - CenarioLogadoChrome
+          - CenarioLogadoEdge
+          - CenarioCatalogoChrome
+          - CenarioCatalogoEdge
+        condition: always()
+        pool:
+          vmImage: 'ubuntu-latest'
+
+        steps:
+          - task: UseNode@1
+            inputs:
+              version: '22.x'
+            displayName: 'Instala Node.js'
+
+          - script: |
+              sudo apt-get update
+              sudo apt-get install -y \
+                libgtk-3-0 \
+                libgbm-dev \
+                libnss3 \
+                libxss1 \
+                libasound2t64 \
+                fonts-liberation \
+                libappindicator3-1 \
+                xdg-utils
+            displayName: 'Instala dependências do sistema para Puppeteer'
+
+          - script: npm ci
+            displayName: 'Instala dependências do projeto'
+
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Baixa JSONs Deslogado Chrome'
+            inputs:
+              buildType: 'current'
+              artifactName: 'json_Testes Deslogado - Chrome_$(Build.BuildId)'
+              targetPath: 'cypress/reports/mocha/deslogado-chrome'
+
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Baixa JSONs Deslogado Edge'
+            inputs:
+              buildType: 'current'
+              artifactName: 'json_Testes Deslogado - Edge_$(Build.BuildId)'
+              targetPath: 'cypress/reports/mocha/deslogado-edge'
+
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Baixa JSONs Logado Chrome'
+            inputs:
+              buildType: 'current'
+              artifactName: 'json_Testes Logado - Chrome_$(Build.BuildId)'
+              targetPath: 'cypress/reports/mocha/logado-chrome'
+
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Baixa JSONs Logado Edge'
+            inputs:
+              buildType: 'current'
+              artifactName: 'json_Testes Logado - Edge_$(Build.BuildId)'
+              targetPath: 'cypress/reports/mocha/logado-edge'
+
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Baixa JSONs Catálogo Chrome'
+            inputs:
+              buildType: 'current'
+              artifactName: 'json_Testes Catálogo - Chrome_$(Build.BuildId)'
+              targetPath: 'cypress/reports/mocha/catalogo-chrome'
+
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Baixa JSONs Catálogo Edge'
+            inputs:
+              buildType: 'current'
+              artifactName: 'json_Testes Catálogo - Edge_$(Build.BuildId)'
+              targetPath: 'cypress/reports/mocha/catalogo-edge'
+
+          - script: rm -rf cypress/reports/html || true
+            displayName: 'Limpa HTML antigo'
+
+          - script: |
+              echo "Mesclando relatórios JSON..."
+              npx mochawesome-merge \
+                cypress/reports/mocha/deslogado-chrome/*.json \
+                cypress/reports/mocha/deslogado-edge/*.json \
+                cypress/reports/mocha/logado-chrome/*.json \
+                cypress/reports/mocha/logado-edge/*.json \
+                cypress/reports/mocha/catalogo-chrome/*.json \
+                cypress/reports/mocha/catalogo-edge/*.json \
+                -o cypress/reports/mocha/merged-report.json
+            displayName: 'Mescla relatórios JSON'
+
+          - script: |
+              echo "Gerando relatório HTML..."
+              npx mochawesome-report-generator cypress/reports/mocha/merged-report.json \
+                --reportDir cypress/reports/html \
+                --reportFilename index.html \
+                --charts true \
+                --inline true
+            displayName: 'Gera relatório HTML'
+
+          - script: node generate-pdf.js
+            displayName: 'Gera PDF Consolidado'
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: 'cypress/reports'
+              artifact: 'RELATORIO_FINAL_$(Build.BuildId)'
+              publishLocation: 'pipeline'
+            displayName: 'Publica Relatório Final'

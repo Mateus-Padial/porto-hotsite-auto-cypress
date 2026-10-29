@@ -1,0 +1,18 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: portoseguro-hotsite-auto
+  description: Portoseguro Hotsite Auto — componente do projeto Porto Seguro (Vertem).
+  annotations:
+    dev.azure.com/project-repo: Porto Seguro/portoseguro-hotsite-auto
+    dev.azure.com/build-definition: portoseguro-hotsite-auto
+    backstage.io/techdocs-ref: dir:.
+  tags:
+    - node
+    - service
+spec:
+  type: service
+  lifecycle: production
+  owner: Porto-Seguro
+  system: system:porto-seguro
+
